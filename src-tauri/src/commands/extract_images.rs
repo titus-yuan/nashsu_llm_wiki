@@ -38,6 +38,10 @@ pub struct ExtractOptions {
     /// (each image base64'd is ~MB-scale) AND blow up downstream VLM
     /// cost during Phase 3.
     pub max_images: usize,
+    /// Number of pages to process per chunk before flushing to disk.
+    /// Keeps memory bounded regardless of total page count.  Default
+    /// 100 pages keeps peak memory ~a few MB even for 1000+ page PDFs.
+    pub chunk_size: usize,
 }
 
 impl Default for ExtractOptions {
@@ -46,6 +50,7 @@ impl Default for ExtractOptions {
             min_width: 100,
             min_height: 100,
             max_images: 500,
+            chunk_size: 100,
         }
     }
 }
@@ -77,6 +82,40 @@ pub struct ExtractedImage {
 }
 
 // ── PDF (pdfium) ────────────────────────────────────────────────────────
+
+/// ── Chunked PDF helpers ────────────────────────────────────────────────
+
+/// Write one chunk of extracted markdown to a temp file.
+/// Returns the file path so it can be concatenated later.
+fn write_chunk(text: &str, source_path: &str, idx: usize) -> Result<std::path::PathBuf, String> {
+    let tmp_dir = std::env::temp_dir().join("llm-wiki-pdf");
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("Failed to create temp dir for PDF chunks: {e}"))?;
+    let slug = std::path::Path::new(source_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pdf");
+    let tmp_path = tmp_dir.join(format!("{slug}_chunk_{idx:04}.md"));
+    std::fs::write(&tmp_path, text)
+        .map_err(|e| format!("Failed to write PDF chunk file: {e}"))?;
+    Ok(tmp_path)
+}
+
+/// Read and concatenate chunk files, cleaning them up afterwards.
+fn merge_chunks(chunk_files: &[std::path::PathBuf]) -> Result<String, String> {
+    let mut out = String::new();
+    for tmp in chunk_files {
+        let text = std::fs::read_to_string(tmp)
+            .map_err(|e| format!("Failed to read chunk file {:?}: {e}", tmp))?;
+        if !out.is_empty() && !text.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&text);
+        std::fs::remove_file(tmp).ok();
+    }
+    Ok(out)
+}
+
 
 /// Combined PDF text + image extraction in a single pdfium session.
 ///
@@ -118,9 +157,14 @@ pub fn extract_pdf_markdown(
         _ => format!("Failed to open PDF '{path}': {e}"),
     })?;
 
+    // ── Chunked processing ──
+    // Flush accumulated text to temp files every `chunk_size` pages
+    // so memory stays bounded regardless of total page count.
+    let mut chunk_files: Vec<std::path::PathBuf> = Vec::new();
     let mut out = String::new();
     let mut idx: u32 = 0;
     let mut total_saved: u32 = 0;
+    let mut pages_in_chunk: usize = 0;
     // Strip a single trailing slash from the prefix so we can always
     // emit `prefix + "/" + name` without producing `path//name`.
     let prefix = media_url_prefix.trim_end_matches('/');
@@ -128,9 +172,21 @@ pub fn extract_pdf_markdown(
     let page_count = doc.pages().len();
     if media_dest_dir.is_some() {
         eprintln!(
-            "[extract_pdf_markdown] '{path}': {page_count} page(s), images→{:?}",
+            "[extract_pdf_markdown] '{path}': {page_count} page(s), chunk_size={}, images→{:?}",
+            options.chunk_size,
             media_dest_dir.map(|d| d.display().to_string())
         );
+    }
+
+    /// Flush the current chunk buffer to a temp file.
+    macro_rules! flush_chunk {
+        ($out:expr, $chunk_files:expr) => {
+            if !$out.is_empty() {
+                let tmp = write_chunk(&$out, path, $chunk_files.len())?;
+                $chunk_files.push(tmp);
+                $out.clear();
+            }
+        };
     }
 
     for (page_idx, page) in doc.pages().iter().enumerate() {
@@ -154,7 +210,14 @@ pub fn extract_pdf_markdown(
         // pixels away.
         let dest_dir = match media_dest_dir {
             Some(d) => d,
-            None => continue,
+            None => {
+                pages_in_chunk += 1;
+                if pages_in_chunk >= options.chunk_size {
+                    flush_chunk!(out, chunk_files);
+                    pages_in_chunk = 0;
+                }
+                continue;
+            }
         };
 
         let mut page_image_md: Vec<String> = Vec::new();
@@ -214,16 +277,32 @@ pub fn extract_pdf_markdown(
                 out.push('\n');
             }
         }
+
+        pages_in_chunk += 1;
+        if pages_in_chunk >= options.chunk_size {
+            flush_chunk!(out, chunk_files);
+            pages_in_chunk = 0;
+        }
+
         if total_saved as usize >= options.max_images {
             break;
         }
     }
 
+    // Flush the final partial chunk
+    flush_chunk!(out, chunk_files);
+
+    // Merge all chunks into a single output string
+    let merged = merge_chunks(&chunk_files)?;
+
     if media_dest_dir.is_some() {
-        eprintln!("[extract_pdf_markdown] '{path}' DONE — pages={page_count}, saved={total_saved}");
+        eprintln!(
+            "[extract_pdf_markdown] '{path}' DONE — pages={page_count}, saved={total_saved}, chunks={}",
+            chunk_files.len()
+        );
     }
 
-    Ok(out)
+    Ok(merged)
 }
 
 /// Iterate every PDF page, extract every embedded raster image, and
