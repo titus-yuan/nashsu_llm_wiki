@@ -51,37 +51,60 @@ pub async fn read_file(path: String) -> Result<String, String> {
                 return Ok(cached);
             }
 
-            match ext.as_str() {
-                "pdf" => extract_pdf_text(&path),
-                e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e),
+            let text = match ext.as_str() {
+                "pdf" => extract_pdf_text(&path)?,
+                e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e)?,
                 e if IMAGE_EXTS.contains(&e) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    Ok(format!("[Image: {} ({:.1} KB)]", p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1024.0))
+                    return Ok(format!(
+                        "[Image: {} ({:.1} KB)]",
+                        p.file_name().unwrap_or_default().to_string_lossy(),
+                        size as f64 / 1024.0
+                    ));
                 }
                 e if MEDIA_EXTS.contains(&e) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    Ok(format!("[Media: {} ({:.1} MB)]", p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1048576.0))
+                    return Ok(format!(
+                        "[Media: {} ({:.1} MB)]",
+                        p.file_name().unwrap_or_default().to_string_lossy(),
+                        size as f64 / 1048576.0
+                    ));
                 }
                 e if LEGACY_DOC_EXTS.contains(&e) => {
-                    Ok(format!("[Document: {} — text extraction not supported for .{} format]",
-                        p.file_name().unwrap_or_default().to_string_lossy(), e))
+                    return Ok(format!(
+                        "[Document: {} — text extraction not supported for .{} format]",
+                        p.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    ));
                 }
                 _ => {
                     match fs::read_to_string(&path) {
-                        Ok(content) => Ok(content),
+                        Ok(content) => return Ok(content),
                         Err(e) => {
                             let exists = p.exists();
                             if !exists {
-                                Err(format!("File does not exist: '{}'", path))
+                                return Err(format!("File does not exist: '{}'", path));
                             } else {
-                                Err(format!(
+                                return Err(format!(
                                     "Failed to read file '{}' as text: {} (likely binary, locked, or non-UTF-8)",
                                     path, e,
-                                ))
+                                ));
                             }
                         }
                     }
                 }
+            };
+            if text.len() > MAX_IPC_TEXT_BYTES {
+                write_cache(p, &text)?;
+                let mb = text.len() / 1024 / 1024;
+                eprintln!(
+                    "[read_file] text too large for IPC ({} MB); cached to {}",
+                    mb,
+                    cache_path_for(p).display()
+                );
+                Ok(format!("cached ({} MB)", mb))
+            } else {
+                Ok(text)
             }
         })
     })
