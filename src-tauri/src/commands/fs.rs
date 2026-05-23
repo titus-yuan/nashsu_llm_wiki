@@ -12,6 +12,12 @@ use crate::types::wiki::FileNode;
 
 /// Known binary formats that need special extraction
 const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "odt", "ods", "odp"];
+
+/// Maximum text size (bytes) returned through Tauri IPC.
+/// Aligned with MAX_HASH_BYTES in file_sync.rs — if a file
+/// is too large to hash, its extracted text is too large for
+/// JSON serialization. Cache is always written to disk first.
+const MAX_IPC_TEXT_BYTES: usize = 32 * 1024 * 1024;
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "heic", "heif", "svg",
 ];
@@ -103,7 +109,18 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
             };
 
             write_cache(p, &text)?;
-            Ok(text)
+            if text.len() > MAX_IPC_TEXT_BYTES {
+                let mb = text.len() / 1024 / 1024;
+                let cache_path = cache_path_for(p);
+                eprintln!(
+                    "[preprocess_file] text too large for IPC ({} MB); cached to {}",
+                    mb,
+                    cache_path.display()
+                );
+                Ok(format!("cached ({} MB)", mb))
+            } else {
+                Ok(text)
+            }
         })
     })
     .await
