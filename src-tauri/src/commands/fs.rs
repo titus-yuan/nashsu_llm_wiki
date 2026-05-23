@@ -17,7 +17,7 @@ const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "odt", "ods", "odp"];
 /// Aligned with MAX_HASH_BYTES in file_sync.rs — if a file
 /// is too large to hash, its extracted text is too large for
 /// JSON serialization. Cache is always written to disk first.
-const MAX_IPC_TEXT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IPC_TEXT_BYTES: usize = 1 * 1024 * 1024;
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "heic", "heif", "svg",
 ];
